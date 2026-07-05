@@ -6,6 +6,10 @@ and sales tracker — built for small board-building shops.
 This is a small Node.js + Express app: a static frontend (plain HTML/CSS/JS, no build
 step) backed by a minimal JSON-file database and a local file store for uploads.
 
+## Pricing
+
+This software costs $100 usd and you have access to it for life, it is done on a 100% trust basis, you're welcome to try it out but if you decide to use it we ask that you send us $100 using the sponsor link on this page.
+
 ## Requirements
 
 - Node.js 16+ (no other system dependencies)
