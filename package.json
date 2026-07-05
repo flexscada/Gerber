@@ -1,0 +1,16 @@
+{
+  "name": "gerber-inventory-tracker",
+  "version": "1.0.0",
+  "description": "Electronics component inventory, BOM/PCB reference, production, purchase planning and sales tracker for small board-building shops.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
