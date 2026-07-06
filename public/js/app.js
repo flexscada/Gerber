@@ -102,7 +102,7 @@ function seedDemo(){
   const board = {
     id: uid('board'), name:'MainCtrl-RevB', description:'Primary controller board',
     boardQty: 42, stockTarget: 50, files: [],
-    image:{ file:null, scale:1, offsetX:0, offsetY:0, rotation:0 }, markerSize: 12, partsScale: 1, view:{scale:1, offsetX:0, offsetY:0},
+    image:{ file:null, scale:1, offsetX:0, offsetY:0, rotation:0 }, view:{scale:1, offsetX:0, offsetY:0}, markerSize: 12, partsScale: 1,
     partsList:[
       {id:uid('bp'), partNumber:'10K-0603', x:186,y:121.5,angle:0,comment:'R1', matchedPartId: db.parts[0].id, qtyPerBoard:4},
       {id:uid('bp'), partNumber:'0.1UF-0603', x:225,y:121.5,angle:90,comment:'C1', matchedPartId: db.parts[1].id, qtyPerBoard:6},
@@ -1470,7 +1470,7 @@ function submitNewBoard(){
     boardQty:Number(document.getElementById('nbQty').value)||0,
     stockTarget: Number(document.getElementById('nbStockTarget').value)||25,
     files: [],
-    image:{file:null, scale:1, offsetX:0, offsetY:0, rotation:0}, markerSize:12, partsScale:1, view:{scale:1, offsetX:0, offsetY:0},
+    image:{file:null, scale:1, offsetX:0, offsetY:0, rotation:0}, view:{scale:1, offsetX:0, offsetY:0}, markerSize:12, partsScale:1,
     partsList:[], productionLog:[], journal:[{id:uid('bj'),date:nowISO(),type:'manual',text:'Product created',qtyDelta:0}]
   };
   DB.boards.push(b); touch(); closeModal(); goPage('boards',{boardId:b.id}); toast('Board created');
@@ -1932,7 +1932,7 @@ function openMatchPicker(boardId, rowId){
     <div class="modal-title">Match Part</div>
     <div class="field"><label>Search parts</label><input type="text" id="mpSearch" value="${escapeHtml(prefill)}" oninput="mpFilter(this.value)"></div>
     <div id="mpList" style="max-height:300px;overflow-y:auto;margin-bottom:12px;">
-    ${DB.parts.map(p=>`<div class="ac-item mp-row" data-s="${escapeHtml(allAliasStrings(p).join(' ').toLowerCase())}" onclick="submitMatch('${boardId}','${rowId}','${p.id}')">${escapeHtml(partPrimaryName(p))} <span class="sub">${escapeHtml(p.category||'')}</span></div>`).join('')}
+    ${DB.parts.map(p=>`<div class="ac-item mp-row" data-s="${escapeHtml([...allAliasStrings(p), p.name||''].join(' ').toLowerCase())}" onclick="submitMatch('${boardId}','${rowId}','${p.id}')">${escapeHtml(partPrimaryName(p))} <span class="sub">${escapeHtml(p.category||'')}</span></div>`).join('')}
     </div>
     <button class="btn btn-sm btn-primary" onclick="openPartForm('${jsAttrEscape(prefill)}', {boardId:'${boardId}', rowId:'${rowId}'})">+ Add New Part</button>
   `);
@@ -1993,6 +1993,25 @@ function ensurePcbDefaults(b){
   if(!b.view) b.view = {scale:1, offsetX:0, offsetY:0};
   if(b.mirrorX===undefined) b.mirrorX = false;
   if(b.mirrorY===undefined) b.mirrorY = false;
+
+  // Purely cosmetic: keep image/view/markerSize/partsScale/mirror fields grouped together
+  // in that order in the saved JSON, regardless of when a board was first created (older
+  // boards may have picked up these fields one at a time via the migrations above, in
+  // whatever order that happened). Rebuilds the same object's key order in place, so
+  // nothing else needs to change — no other code holds a stale reference to worry about.
+  const keys = Object.keys(b);
+  const imgIdx = keys.indexOf('image');
+  if(imgIdx!==-1 && keys[imgIdx+1]!=='view'){
+    const rest = ['view','markerSize','partsScale','mirrorX','mirrorY'];
+    const ordered = {};
+    keys.forEach(k=>{
+      if(rest.includes(k)) return;
+      ordered[k] = b[k];
+      if(k==='image') rest.forEach(rk=>{ ordered[rk] = b[rk]; });
+    });
+    Object.keys(b).forEach(k=>delete b[k]);
+    Object.assign(b, ordered);
+  }
 }
 function renderBoardPCB(b){
   ensurePcbDefaults(b);
@@ -2202,9 +2221,26 @@ function renderFilesListHtml(files, entityType, entityId){
       </span>
     </div>`).join('') + `</div>`;
 }
+/* The view (pan/zoom position) shown on screen is tracked separately from the SAVED
+   default (b.view) — casual browsing/panning only ever touches this local copy, so one
+   person looking around doesn't overwrite the shared default or clash with someone else's
+   in-progress alignment. The saved default only changes when "Edit Image" mode is active
+   and you pan/zoom the view — that's treated as a deliberate "this is what people should
+   see by default" action, same as the alignment fields already work.
+   pcbLocalView needs to survive ordinary in-page re-renders (adding a BOM row, editing a
+   field, toggling edit mode, etc.) or every one of those would snap the view back to the
+   saved default — it should only reset when actually switching to a different board. */
+let pcbLocalView = null;
+let pcbLocalViewBoardId = null;
+function ensurePcbLocalView(b){
+  if(pcbLocalViewBoardId !== b.id){
+    pcbLocalView = {...b.view};
+    pcbLocalViewBoardId = b.id;
+  }
+}
 function applyPcbWorldTransform(b){
   const world = document.getElementById('pcbWorld');
-  if(world) world.style.transform = `translate(${b.view.offsetX}px,${b.view.offsetY}px) scale(${b.view.scale})`;
+  if(world && pcbLocalView) world.style.transform = `translate(${pcbLocalView.offsetX}px,${pcbLocalView.offsetY}px) scale(${pcbLocalView.scale})`;
 }
 function applyPcbImageTransform(b){
   const img = document.getElementById('pcbImg');
@@ -2269,10 +2305,15 @@ function pcbResetAlignment(boardId){
 function pcbResetView(boardId){
   const b = findBoard(boardId);
   ensurePcbDefaults(b);
-  b.view.scale = 1; b.view.offsetX = 0; b.view.offsetY = 0;
+  if(pcbEditMode){
+    b.view.scale = 1; b.view.offsetX = 0; b.view.offsetY = 0;
+    schedulePcbViewSave();
+  }
+  pcbLocalView = {...b.view};
+  pcbLocalViewBoardId = b.id;
   applyPcbWorldTransform(b);
   applyPcbMarkerCounterScale(b);
-  toast('View reset');
+  toast(pcbEditMode ? 'Default view reset' : 'View reset to saved default');
 }
 function savePcbAlignment(boardId){
   touch();
@@ -2298,6 +2339,7 @@ function setupPcbReadOnlyInteraction(b){
   const wrap = document.getElementById('pcbWrap');
   if(!wrap) return;
   ensurePcbDefaults(b);
+  ensurePcbLocalView(b);
   applyPcbWorldTransform(b);
   applyPcbImageTransform(b);
   positionPcbMarkers(b);
@@ -2306,7 +2348,7 @@ function setupPcbReadOnlyInteraction(b){
   let drag = null;
   wrap.onpointerdown = e=>{
     const markerEl = e.target && e.target.closest ? e.target.closest('.pcb-marker') : null;
-    drag = { startX:e.clientX, startY:e.clientY, ox:b.view.offsetX, oy:b.view.offsetY, pointerId:e.pointerId, markerBpId: markerEl?markerEl.dataset.bpId:null, moved:false };
+    drag = { startX:e.clientX, startY:e.clientY, ox:pcbLocalView.offsetX, oy:pcbLocalView.offsetY, pointerId:e.pointerId, markerBpId: markerEl?markerEl.dataset.bpId:null, moved:false };
     wrap.classList.add('dragging');
     wrap.setPointerCapture(e.pointerId);
     e.preventDefault();
@@ -2315,15 +2357,15 @@ function setupPcbReadOnlyInteraction(b){
     if(!drag) return;
     const dx = e.clientX-drag.startX, dy = e.clientY-drag.startY;
     if(Math.abs(dx)>CLICK_THRESHOLD || Math.abs(dy)>CLICK_THRESHOLD) drag.moved = true;
-    b.view.offsetX = drag.ox + dx;
-    b.view.offsetY = drag.oy + dy;
+    pcbLocalView.offsetX = drag.ox + dx;
+    pcbLocalView.offsetY = drag.oy + dy;
     applyPcbWorldTransform(b);
   };
   const endDrag = ()=>{
     if(drag){
       try{ wrap.releasePointerCapture(drag.pointerId); }catch(err){}
       if(!drag.moved && drag.markerBpId) openPcbPartPopup(b.id, drag.markerBpId);
-      else if(drag.moved) schedulePcbViewSave();
+      // Panning here is purely local (just looking around) — never saved.
     }
     drag = null;
     wrap.classList.remove('dragging');
@@ -2335,22 +2377,23 @@ function setupPcbReadOnlyInteraction(b){
     e.preventDefault();
     const rect = wrap.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const oldScale = b.view.scale;
+    const oldScale = pcbLocalView.scale;
     const newScale = Math.max(0.1, Math.min(10, oldScale + (e.deltaY<0?oldScale*0.1:-oldScale*0.1)));
-    const worldX = (mx - b.view.offsetX) / oldScale;
-    const worldY = (my - b.view.offsetY) / oldScale;
-    b.view.offsetX = mx - worldX*newScale;
-    b.view.offsetY = my - worldY*newScale;
-    b.view.scale = newScale;
+    const worldX = (mx - pcbLocalView.offsetX) / oldScale;
+    const worldY = (my - pcbLocalView.offsetY) / oldScale;
+    pcbLocalView.offsetX = mx - worldX*newScale;
+    pcbLocalView.offsetY = my - worldY*newScale;
+    pcbLocalView.scale = newScale;
     applyPcbWorldTransform(b);
     applyPcbMarkerCounterScale(b);
-    schedulePcbViewSave();
+    // Zooming here is purely local too — never saved.
   };
 }
 function setupPcbInteraction(b){
   const wrap = document.getElementById('pcbWrap');
   if(!wrap) return;
   ensurePcbDefaults(b);
+  ensurePcbLocalView(b);
   applyPcbWorldTransform(b);
   applyPcbImageTransform(b);
   positionPcbMarkers(b);
@@ -2366,8 +2409,8 @@ function setupPcbInteraction(b){
     pcbDrag = {
       startX:e.clientX, startY:e.clientY,
       isImageMove,
-      ox: isImageMove ? b.image.offsetX : b.view.offsetX,
-      oy: isImageMove ? b.image.offsetY : b.view.offsetY,
+      ox: isImageMove ? b.image.offsetX : pcbLocalView.offsetX,
+      oy: isImageMove ? b.image.offsetY : pcbLocalView.offsetY,
       pointerId:e.pointerId,
       markerBpId: markerEl ? markerEl.dataset.bpId : null,
       moved:false
@@ -2387,8 +2430,8 @@ function setupPcbInteraction(b){
       applyPcbImageTransform(b);
       syncPcbInputs(b);
     } else {
-      b.view.offsetX = pcbDrag.ox + dx;
-      b.view.offsetY = pcbDrag.oy + dy;
+      pcbLocalView.offsetX = pcbDrag.ox + dx;
+      pcbLocalView.offsetY = pcbDrag.oy + dy;
       applyPcbWorldTransform(b);
     }
   };
@@ -2397,7 +2440,11 @@ function setupPcbInteraction(b){
       try{ wrap.releasePointerCapture(pcbDrag.pointerId); }catch(err){}
       if(!pcbDrag.moved && pcbDrag.markerBpId && !pcbDrag.isImageMove){
         openPcbPartPopup(b.id, pcbDrag.markerBpId);
-      } else if(pcbDrag.moved){
+      } else if(pcbDrag.moved && !pcbDrag.isImageMove && pcbEditMode){
+        // Only a deliberate pan while Edit Image is on updates the saved default view —
+        // otherwise this was just local browsing and shouldn't overwrite anyone else's.
+        b.view.offsetX = pcbLocalView.offsetX;
+        b.view.offsetY = pcbLocalView.offsetY;
         schedulePcbViewSave();
       }
     }
@@ -2414,16 +2461,22 @@ function setupPcbInteraction(b){
     // accidentally throw off a calibrated image scale while you're just browsing around.
     const rect = wrap.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const oldScale = b.view.scale;
+    const oldScale = pcbLocalView.scale;
     const newScale = Math.max(0.1, Math.min(10, oldScale + (e.deltaY<0?oldScale*0.1:-oldScale*0.1)));
-    const worldX = (mx - b.view.offsetX) / oldScale;
-    const worldY = (my - b.view.offsetY) / oldScale;
-    b.view.offsetX = mx - worldX*newScale;
-    b.view.offsetY = my - worldY*newScale;
-    b.view.scale = newScale;
+    const worldX = (mx - pcbLocalView.offsetX) / oldScale;
+    const worldY = (my - pcbLocalView.offsetY) / oldScale;
+    pcbLocalView.offsetX = mx - worldX*newScale;
+    pcbLocalView.offsetY = my - worldY*newScale;
+    pcbLocalView.scale = newScale;
     applyPcbWorldTransform(b);
     applyPcbMarkerCounterScale(b);
-    schedulePcbViewSave();
+    // Same rule as panning: only persist as the default while Edit Image mode is active.
+    if(pcbEditMode){
+      b.view.offsetX = pcbLocalView.offsetX;
+      b.view.offsetY = pcbLocalView.offsetY;
+      b.view.scale = pcbLocalView.scale;
+      schedulePcbViewSave();
+    }
   };
   wrap.ondblclick = e=>{
     // Ignore double-clicks that land on an existing bubble — that's handled by the
@@ -2431,8 +2484,8 @@ function setupPcbInteraction(b){
     if(e.target && e.target.closest && e.target.closest('.pcb-marker')) return;
     const rect = wrap.getBoundingClientRect();
     const relX = e.clientX - rect.left, relY = e.clientY - rect.top;
-    const worldX = (relX - b.view.offsetX) / b.view.scale;
-    const worldY = (relY - b.view.offsetY) / b.view.scale;
+    const worldX = (relX - pcbLocalView.offsetX) / pcbLocalView.scale;
+    const worldY = (relY - pcbLocalView.offsetY) / pcbLocalView.scale;
     const ps = b.partsScale || 1;
     let x = worldX/ps, y = worldY/ps;
     if(b.mirrorX) x = -x;
@@ -2464,12 +2517,24 @@ function positionPcbMarkers(b){
    inside it, the tooltip text too) so both stay a constant on-screen size while panning/
    zooming — the same way map pins/labels don't grow or shrink as you zoom a map. */
 function applyPcbMarkerCounterScale(b){
-  const s = 1 / ((b.view && b.view.scale) || 1);
+  const s = 1 / ((pcbLocalView && pcbLocalView.scale) || 1);
   document.querySelectorAll('.pcb-marker').forEach(el=>{ el.style.transform = `scale(${s})`; });
 }
 function pcbHighlight(rowId, on){
   const el = document.getElementById('mk_'+rowId);
   if(el) el.classList.toggle('hi', on);
+}
+function goToBomWithFilter(boardId, filterText){
+  boardTab = 'bom';
+  bomFilterText = filterText || '';
+  closeModal();
+  renderAll();
+}
+function promptDeleteBomRowFromPopup(boardId, rowId, label){
+  confirmAction(`Remove "${label}" from this product's BOM? This can't be undone.`, ()=>{
+    removeBomRow(boardId, rowId);
+    toast('BOM row removed');
+  });
 }
 function openPcbPartPopup(boardId, bpRowId){
   const b = findBoard(boardId);
@@ -2482,7 +2547,10 @@ function openPcbPartPopup(boardId, bpRowId){
     openModal(`
       <div class="modal-title">${escapeHtml(bp.comment||bp.partNumber)}</div>
       <div class="page-desc" style="margin-bottom:14px;">"${escapeHtml(bp.partNumber)}" isn't matched to a component yet.</div>
-      <button class="btn btn-primary btn-sm" onclick="closeModal();boardTab='bom';renderAll();">Go Match It in BOM →</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-primary btn-sm" onclick="goToBomWithFilter('${boardId}','${jsAttrEscape(bp.partNumber)}')">Go Match It in BOM →</button>
+        <button class="btn btn-sm btn-danger" onclick="promptDeleteBomRowFromPopup('${boardId}','${bpRowId}','${jsAttrEscape(bp.comment||bp.partNumber)}')">Delete Part</button>
+      </div>
     `);
     return;
   }
@@ -2504,7 +2572,9 @@ function openPcbPartPopup(boardId, bpRowId){
     <div class="kv"><span>Supplier</span><b>${part.currentSupplier ? (part.productLink ? `<a href="${escapeHtml(part.productLink)}" target="_blank" rel="noopener" style="color:var(--trace);">${escapeHtml(part.currentSupplier)} ↗</a>` : escapeHtml(part.currentSupplier)) : '—'}</b></div>
     <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;">
       ${part.productLink ? `<a class="btn btn-sm" href="${escapeHtml(part.productLink)}" target="_blank" rel="noopener">Open Supplier Page ↗</a>` : ''}
+      <button class="btn btn-sm" onclick="goToBomWithFilter('${boardId}','${jsAttrEscape(bp.partNumber)}')">View in BOM →</button>
       <button class="btn btn-sm btn-primary" onclick="closeModal();goPage('parts',{partId:'${part.id}'})">View Component Page →</button>
+      <button class="btn btn-sm btn-danger" onclick="promptDeleteBomRowFromPopup('${boardId}','${bpRowId}','${jsAttrEscape(bp.comment||bp.partNumber)}')">Delete Part</button>
     </div>
   `);
 }
