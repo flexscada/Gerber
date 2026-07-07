@@ -13,23 +13,52 @@ const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 // Make sure the data directories exist before anything tries to read/write them.
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
-/* ============================= VERSIONING =============================
-   To support multiple people using this at once without silently clobbering each
-   other's edits: every save bumps an in-memory version counter (persisted into
-   config.json's own meta so it survives a server restart). Clients poll GET
-   /api/version (cheap — no disk read) roughly every second and pull a fresh copy
-   when it moves. Saves also carry the version the client last saw; if that's
-   stale (someone else saved in between), the write is rejected instead of
-   overwriting the newer data, and the client is hands back the current copy. */
+/* ============================= VERSIONING & IN-MEMORY CONFIG =============================
+   To support multiple people using this at once without silently clobbering each other's
+   edits: every save bumps a version counter, and the whole config document is kept in
+   memory as the live source of truth while the server runs — reads and writes just touch
+   that in-memory copy so a burst of saves (or a bunch of clients polling) doesn't hammer
+   disk I/O. It's written to config.json periodically (every 5 minutes) and on a graceful
+   shutdown (Ctrl+C / SIGTERM), plus the version is embedded in the document so it survives
+   a restart. Clients poll GET /api/version (cheap — just returns the in-memory number) and
+   pull a fresh copy when it moves. Saves also carry the version the client last saw; if
+   that's stale (someone else saved in between), the write is rejected instead of
+   overwriting the newer data, and the client is handed the current copy back. */
 let currentVersion = 0;
+let configCache = null;   // the live, in-memory database — null until the first save ever happens
+let configDirty = false;  // true if configCache has changes not yet written to config.json
+const FLUSH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
 if (fs.existsSync(CONFIG_PATH)) {
   try {
-    const existing = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    currentVersion = (existing.meta && existing.meta.version) || 1;
+    configCache = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    currentVersion = (configCache.meta && configCache.meta.version) || 1;
   } catch (err) {
-    console.warn('Could not read existing config.json version on startup:', err.message);
+    console.warn('Could not read existing config.json on startup:', err.message);
   }
 }
+
+function flushConfigToDisk() {
+  if (!configDirty || !configCache) return;
+  try {
+    const tmpPath = CONFIG_PATH + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(configCache, null, 2));
+    fs.renameSync(tmpPath, CONFIG_PATH);
+    configDirty = false;
+    console.log(`[${new Date().toISOString()}] config.json flushed to disk (version ${currentVersion})`);
+  } catch (err) {
+    console.error('Failed to flush config.json to disk:', err.message);
+  }
+}
+setInterval(flushConfigToDisk, FLUSH_INTERVAL_MS);
+
+function shutdown() {
+  console.log('Shutting down — flushing config to disk...');
+  flushConfigToDisk();
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 app.use(express.json({ limit: '20mb' })); // config.json body (no more base64 images in it, so this is generous headroom)
 app.use(express.static(path.join(__dirname, 'public')));
@@ -38,21 +67,17 @@ app.use('/media', express.static(MEDIA_DIR, { maxAge: '1d' }));
 /* ============================= CONFIG API =============================
    The whole app database (parts, boards, sales, journal, etc.) is a single JSON
    document, same shape as the old browser-only export file — just persisted here
-   instead of only living in memory. */
+   instead of only living in browser memory (well — it does still live in memory! just
+   also on disk, per the flush strategy above). */
 app.get('/api/config', (req, res) => {
-  if (!fs.existsSync(CONFIG_PATH)) {
+  if (!configCache) {
     return res.status(404).json({ error: 'No config.json yet' });
   }
-  try {
-    const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
-    res.type('application/json').send(raw);
-  } catch (err) {
-    res.status(500).json({ error: 'Could not read config.json: ' + err.message });
-  }
+  res.json(configCache);
 });
 
 // Lightweight endpoint for the frontend to poll frequently — just the in-memory
-// number, no disk access, so polling every second is essentially free.
+// number, no disk access, so polling every 200ms is essentially free.
 app.get('/api/version', (req, res) => {
   res.json({ version: currentVersion });
 });
@@ -66,31 +91,16 @@ app.put('/api/config', (req, res) => {
   // client is expected to pull the fresh copy (the response includes it) instead
   // of blindly retrying with stale data.
   if (clientVersion !== null && clientVersion !== currentVersion) {
-    if (!fs.existsSync(CONFIG_PATH)) {
-      return res.status(409).json({ error: 'version_conflict', currentVersion, currentConfig: null });
-    }
-    try {
-      const latest = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-      return res.status(409).json({ error: 'version_conflict', currentVersion, currentConfig: latest });
-    } catch (err) {
-      return res.status(409).json({ error: 'version_conflict', currentVersion, currentConfig: null });
-    }
+    return res.status(409).json({ error: 'version_conflict', currentVersion, currentConfig: configCache });
   }
 
-  try {
-    currentVersion += 1;
-    const body = req.body || {};
-    body.meta = body.meta || {};
-    body.meta.version = currentVersion;
-
-    const tmpPath = CONFIG_PATH + '.tmp';
-    fs.writeFileSync(tmpPath, JSON.stringify(body, null, 2));
-    fs.renameSync(tmpPath, CONFIG_PATH); // atomic-ish swap so a crash mid-write can't corrupt the real file
-    res.json({ ok: true, version: currentVersion });
-  } catch (err) {
-    currentVersion -= 1; // the write failed, don't advance the version for nothing
-    res.status(500).json({ error: 'Could not save config.json: ' + err.message });
-  }
+  currentVersion += 1;
+  const body = req.body || {};
+  body.meta = body.meta || {};
+  body.meta.version = currentVersion;
+  configCache = body;
+  configDirty = true;
+  res.json({ ok: true, version: currentVersion });
 });
 
 /* ============================= MEDIA API =============================

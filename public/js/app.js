@@ -127,21 +127,24 @@ function seedDemo(){
    actual save to the server is debounced so rapid edits collapse into one request.
 
    Multi-user safety: the server tracks a version number that increments on every
-   save. We poll /api/version once a second; if it's moved past what we last saw,
-   another session made a change, so we pull the fresh copy and apply it — unless
-   we're in the middle of something local (unsaved edits, a save in flight, a modal
-   open, or a field focused), in which case we just wait for the next poll rather
-   than yanking data out from under an active edit. Saves also carry the version we
-   last saw; if the server's moved on since, the save is rejected instead of
-   silently overwriting someone else's newer change, and we pull their copy instead. */
+   save. We poll /api/version every 200ms; if it's moved past what we last saw,
+   another session made a change, so we pull the fresh copy — this applies to the
+   in-memory DB right away (so a modal you submit later is building on the latest
+   data, not something stale), but if a modal is open or a field is focused we defer
+   the *visual* refresh and notification until you're done, so an incoming update
+   can't yank a form out from under you mid-edit. We only hold off touching DB at
+   all if we have our own uncommitted save in flight — that gets to resolve first.
+   Saves also carry the version we last saw; if the server's moved on since, the
+   save is rejected instead of silently overwriting someone else's newer change,
+   and we pull their copy instead. */
 let localVersion = 0;
 let saveTimer = null;
 let saveInFlight = false;
 let saveQueued = false;
 let pollTimer = null;
+let pendingSyncNotice = false; // a background update was applied to DB silently; still owe the user a re-render + toast once they're free
 
-function shouldDeferIncomingUpdate(){
-  if(hasUnsavedChanges || saveInFlight || saveQueued) return true;
+function isUiBusy(){
   const modalOpen = document.getElementById('modalOverlay').classList.contains('active');
   if(modalOpen) return true;
   const active = document.activeElement;
@@ -228,24 +231,38 @@ async function loadFromServer(){
 function startVersionPolling(){
   clearInterval(pollTimer);
   pollTimer = setInterval(async ()=>{
+    // A previous tick may have applied an update silently because a modal was open or a
+    // field was focused — as soon as that's no longer true, reveal it, even if nothing
+    // newer has arrived since.
+    if(pendingSyncNotice && !isUiBusy()){
+      pendingSyncNotice = false;
+      hasUnsavedChanges = false;
+      renderAll();
+      toast('The database was updated by another user — changes automatically applied!');
+      return;
+    }
+    if(saveInFlight || saveQueued || hasUnsavedChanges) return; // let our own pending save resolve first
     try{
       const res = await fetch('/api/version');
       if(!res.ok) return;
       const { version } = await res.json();
-      if(version>localVersion && !shouldDeferIncomingUpdate()){
-        const configRes = await fetch('/api/config');
-        if(!configRes.ok) return;
-        DB = await configRes.json();
-        DB.banners = DB.banners || [];
-        DB.journal = DB.journal || [];
-        DB.purchasePlanning = DB.purchasePlanning || { boardQtys:{}, stockMode:'inventory' };
-        localVersion = (DB.meta && DB.meta.version) || version;
+      if(version<=localVersion) return;
+      const configRes = await fetch('/api/config');
+      if(!configRes.ok) return;
+      DB = await configRes.json();
+      DB.banners = DB.banners || [];
+      DB.journal = DB.journal || [];
+      DB.purchasePlanning = DB.purchasePlanning || { boardQtys:{}, stockMode:'inventory' };
+      localVersion = (DB.meta && DB.meta.version) || version;
+      if(isUiBusy()){
+        pendingSyncNotice = true; // applied to DB already — just deferring the reveal
+      } else {
         hasUnsavedChanges = false;
         renderAll();
         toast('The database was updated by another user — changes automatically applied!');
       }
     }catch(err){ /* transient network hiccup — just try again next tick */ }
-  }, 1000);
+  }, 200);
 }
 
 loadFromServer();
@@ -325,6 +342,54 @@ function toast(msg){
 }
 function findPart(id){ return DB.parts.find(p=>p.id===id); }
 function findBoard(id){ return DB.boards.find(b=>b.id===id); }
+/* Since other sessions' changes can now land in the background at any time (even while
+   a modal is open), an entity a modal was opened for might be gone by the time its submit
+   handler runs — these bail out with a clear message instead of throwing on `undefined`
+   or silently doing nothing. */
+function requirePart(id, actionLabel){
+  const p = findPart(id);
+  if(!p){ closeModal(); toast(`Can't ${actionLabel} — this part no longer exists (someone else may have deleted it).`); renderAll(); return null; }
+  return p;
+}
+function requireBoard(id, actionLabel){
+  const b = findBoard(id);
+  if(!b){ closeModal(); toast(`Can't ${actionLabel} — this product no longer exists (someone else may have deleted it).`); renderAll(); return null; }
+  return b;
+}
+function requireBomRow(boardId, rowId, actionLabel){
+  const b = requireBoard(boardId, actionLabel);
+  if(!b) return null;
+  const row = b.partsList.find(r=>r.id===rowId);
+  if(!row){ closeModal(); toast(`Can't ${actionLabel} — this BOM row no longer exists (someone else may have removed it).`); renderAll(); return null; }
+  return { board:b, row };
+}
+function requireSale(id, actionLabel){
+  const s = DB.sales.find(x=>x.id===id);
+  if(!s){ closeModal(); toast(`Can't ${actionLabel} — this sale no longer exists (someone else may have deleted it).`); renderAll(); return null; }
+  return s;
+}
+/* General safety net around functions that modify the database. The requireX() checks
+   above handle the expected case (something got deleted out from under you) with a clear,
+   specific message — this catches anything else unexpected so a bug or edge case surfaces
+   as a visible error instead of a silent failure or a broken half-updated page. Always
+   re-renders in the catch too, so the UI reflects whatever state actually exists rather
+   than looking frozen on a stale view. */
+function showErrorModal(err){
+  console.error(err);
+  const message = (err && err.message) ? err.message : String(err);
+  openModal(`
+    <div class="modal-title" style="color:var(--red);">⚠️ Operation Failed</div>
+    <div class="page-desc" style="margin-bottom:0;">${escapeHtml(message)}</div>
+  `);
+  try{ renderAll(); }catch(renderErr){ console.error('Also failed to re-render after an error:', renderErr); }
+}
+function safeApply(fn){
+  try{
+    fn();
+  }catch(err){
+    showErrorModal(err);
+  }
+}
 function partPrimaryName(p){ return (p.name && p.name.trim()) ? p.name.trim() : (p.aliases[0] ? p.aliases[0].value : '(no alias)'); }
 function allAliasStrings(p){ return p.aliases.map(a=>a.value); }
 function allSupplierNames(){ return Array.from(new Set(DB.parts.map(p=>p.currentSupplier).filter(Boolean))).sort(); }
@@ -494,7 +559,15 @@ function openModal(html){
   body.innerHTML = `<span class="modal-close" onclick="closeModal()">❌</span>${html}`;
   document.getElementById('modalOverlay').classList.add('active');
 }
-function closeModal(){ document.getElementById('modalOverlay').classList.remove('active'); }
+function closeModal(){
+  document.getElementById('modalOverlay').classList.remove('active');
+  if(pendingSyncNotice && !isUiBusy()){
+    pendingSyncNotice = false;
+    hasUnsavedChanges = false;
+    renderAll();
+    toast('The database was updated by another user — changes automatically applied!');
+  }
+}
 function openImageViewer(url, title){
   openModal(`
     <div class="modal-title">${escapeHtml(title||'Image')}</div>
@@ -814,11 +887,12 @@ function openUsedByModal(partId){
   `);
 }
 function deletePart(id){
-  confirmAction('Delete this part? This cannot be undone.', ()=>{
+  confirmAction('Delete this part? This cannot be undone.', ()=>safeApply(()=>{
+    if(!requirePart(id, 'delete this part')) return;
     DB.parts = DB.parts.filter(p=>p.id!==id);
     DB.boards.forEach(b=> b.partsList.forEach(bp=>{ if(bp.matchedPartId===id) bp.matchedPartId=null; }));
     touch(); renderAll(); toast('Part deleted');
-  });
+  }));
 }
 function removePartImage(partId){
   const p = findPart(partId);
@@ -1168,8 +1242,9 @@ function openPartEditForm(id){
     <button class="btn btn-primary" onclick="submitPartEdit('${p.id}')">Save Changes</button>
   `);
 }
-function submitPartEdit(id){
-  const p = findPart(id);
+function submitPartEdit(id){ safeApply(()=>{
+  const p = requirePart(id, 'save this part');
+  if(!p) return;
   const comment = document.getElementById('epComment').value.trim() || 'Field updated';
   const oldDisplay = partPrimaryName(p);
   const newName = document.getElementById('epName').value.trim();
@@ -1191,7 +1266,7 @@ function submitPartEdit(id){
   const newSupplier = document.getElementById('epSupplier').value.trim();
   if(newSupplier !== p.currentSupplier){ p.history.supplier.push({id:uid('h'),date:nowISO(),value:newSupplier,comment}); p.currentSupplier = newSupplier; }
   touch(); closeModal(); renderAll(); toast('Part updated');
-}
+}); }
 
 function openAliasForm(partId){
   openModal(`
@@ -1231,8 +1306,8 @@ function openOnOrderForm(partId){
     </div>
   `);
 }
-function submitOnOrderEdit(partId){
-  const p = findPart(partId);
+function submitOnOrderEdit(partId){ safeApply(()=>{
+  const p = requirePart(partId, 'update on order');
   if(!p) return;
   const newQty = Math.max(0, Number(document.getElementById('ooQty').value)||0);
   const comment = document.getElementById('ooComment').value.trim();
@@ -1242,27 +1317,31 @@ function submitOnOrderEdit(partId){
   p.history.onOrder.push({id:uid('h'), date:nowISO(), value:newQty, delta, comment: comment || 'On order quantity updated'});
   p.onOrder = newQty;
   touch(); closeModal(); renderAll(); toast('On order updated');
-}
+}); }
 function receiveOnOrderInFull(partId){
-  const p = findPart(partId);
+  const p = requirePart(partId, 'receive this purchase');
   if(!p || !(p.onOrder>0)) return;
   const qty = p.onOrder;
-  confirmAction(`Receive all ${qty} pending for ${partPrimaryName(p)}? This adds ${qty} to stock and completes the pending purchase.`, ()=>{
+  confirmAction(`Receive all ${qty} pending for ${partPrimaryName(p)}? This adds ${qty} to stock and completes the pending purchase.`, ()=>safeApply(()=>{
+    const fresh = requirePart(partId, 'receive this purchase');
+    if(!fresh) return;
     // applyStockOp's "add" already reduces on-order by the amount received, so receiving
     // the full pending qty here brings on-order down to exactly 0 in one step.
-    applyStockOp(p, 'add', qty, 'Received in full against pending purchase');
+    applyStockOp(fresh, 'add', qty, 'Received in full against pending purchase');
     closeModal(); renderAll(); toast('Purchase received in full');
-  });
+  }));
 }
 function cancelOnOrderQty(partId){
-  const p = findPart(partId);
+  const p = requirePart(partId, 'cancel this purchase');
   if(!p) return;
-  confirmAction(`Cancel the pending purchase of ${p.onOrder} for ${partPrimaryName(p)}?`, ()=>{
-    if(!p.history.onOrder) p.history.onOrder = [];
-    p.history.onOrder.push({id:uid('h'), date:nowISO(), value:0, delta:-(p.onOrder||0), comment:'Pending purchase cancelled'});
-    p.onOrder = 0;
+  confirmAction(`Cancel the pending purchase of ${p.onOrder} for ${partPrimaryName(p)}?`, ()=>safeApply(()=>{
+    const fresh = requirePart(partId, 'cancel this purchase');
+    if(!fresh) return;
+    if(!fresh.history.onOrder) fresh.history.onOrder = [];
+    fresh.history.onOrder.push({id:uid('h'), date:nowISO(), value:0, delta:-(fresh.onOrder||0), comment:'Pending purchase cancelled'});
+    fresh.onOrder = 0;
     touch(); closeModal(); renderAll(); toast('Pending purchase cancelled');
-  });
+  }));
 }
 const STOCK_OPS = [
   {key:'add', label:'Add', desc:'Add received stock to current inventory. Also reduces On Order by the same amount if there is a pending purchase.'},
@@ -1300,12 +1379,13 @@ function saSetOp(op){
   document.getElementById('saQtyField').style.display = op==='comment' ? 'none':'block';
   document.getElementById('saOnOrderHint').style.display = op==='onorder' ? 'block':'none';
 }
-function submitStockAdjust(partId){
-  const p = findPart(partId);
+function submitStockAdjust(partId){ safeApply(()=>{
+  const p = requirePart(partId, 'adjust stock');
+  if(!p) return;
   const comment = document.getElementById('saComment').value.trim();
   applyStockOp(p, saCurrentOp, Number(document.getElementById('saQty').value)||0, comment);
   closeModal(); renderAll(); toast('Stock updated');
-}
+}); }
 function applyStockOp(p, op, qty, comment, source){
   let delta = 0; let newVal = p.currentQty;
   if(op==='add'){ delta = qty; newVal = p.currentQty + qty; }
@@ -1476,12 +1556,14 @@ function submitNewBoard(){
   DB.boards.push(b); touch(); closeModal(); goPage('boards',{boardId:b.id}); toast('Board created');
 }
 function deleteBoard(id){
-  confirmAction('Delete this product and all its logs?', ()=>{
+  confirmAction('Delete this product and all its logs?', ()=>safeApply(()=>{
+    if(!requireBoard(id, 'delete this product')) return;
     DB.boards = DB.boards.filter(b=>b.id!==id); touch(); renderAll(); toast('Board deleted');
-  });
+  }));
 }
 function openBoardEditForm(id){
-  const b = findBoard(id);
+  const b = requireBoard(id, 'edit this product');
+  if(!b) return;
   openModal(`
     <div class="modal-title">Edit Product</div>
     <div class="field"><label>Product Name</label><input type="text" id="ebName" value="${escapeHtml(b.name)}"></div>
@@ -1490,8 +1572,9 @@ function openBoardEditForm(id){
     <button class="btn btn-primary" onclick="submitBoardEdit('${b.id}')">Save Changes</button>
   `);
 }
-function submitBoardEdit(id){
-  const b = findBoard(id);
+function submitBoardEdit(id){ safeApply(()=>{
+  const b = requireBoard(id, 'save this product');
+  if(!b) return;
   const newName = document.getElementById('ebName').value.trim();
   if(!newName){ toast('Product name required'); return; }
   const oldName = b.name;
@@ -1502,7 +1585,7 @@ function submitBoardEdit(id){
     b.journal.push({id:uid('bj'), date:nowISO(), type:'manual', text:`Product renamed: "${oldName}" → "${newName}"`, qtyDelta:0});
   }
   touch(); closeModal(); renderAll(); toast('Product updated');
-}
+}); }
 
 /* ============================= BOARD DETAIL ============================= */
 let boardTab = 'overview';
@@ -1836,26 +1919,30 @@ function brPnSelect(value){
   if(input) input.value = value;
   brPnFilter(value);
 }
-function submitBomRow(boardId){
-  const b = findBoard(boardId);
+function submitBomRow(boardId){ safeApply(()=>{
+  const b = requireBoard(boardId, 'add this BOM row');
+  if(!b) return;
   const pn = document.getElementById('brPn').value.trim();
   if(!pn) return;
   const match = fuzzyMatchParts(pn);
   b.partsList.push({id:uid('bp'), partNumber:pn, x:Number(document.getElementById('brX').value)||0, y:Number(document.getElementById('brY').value)||0, angle:Number(document.getElementById('brA').value)||0, comment:document.getElementById('brC').value.trim(), matchedPartId: match.length?match[0].part.id:null, qtyPerBoard:1});
   touch(); closeModal(); renderAll(); toast('Row added');
-}
-function removeBomRow(boardId, rowId){
-  const b = findBoard(boardId);
+}); }
+function removeBomRow(boardId, rowId){ safeApply(()=>{
+  const b = requireBoard(boardId, 'remove this row');
+  if(!b) return;
   b.partsList = b.partsList.filter(r=>r.id!==rowId);
   touch(); renderAll();
-}
+}); }
 function deleteAllBomRows(boardId){
   const b = findBoard(boardId);
   if(!b || b.partsList.length===0){ toast('No rows to delete'); return; }
-  confirmAction(`Delete all ${b.partsList.length} BOM rows for ${b.name}? This cannot be undone.`, ()=>{
-    b.partsList = [];
+  confirmAction(`Delete all ${b.partsList.length} BOM rows for ${b.name}? This cannot be undone.`, ()=>safeApply(()=>{
+    const fresh = requireBoard(boardId, 'delete all BOM rows');
+    if(!fresh) return;
+    fresh.partsList = [];
     touch(); renderAll(); toast('All BOM rows deleted');
-  });
+  }));
 }
 function csvEscape(val){
   const s = String(val===undefined||val===null?'':val);
@@ -1907,10 +1994,10 @@ function submitExportPickPlaceCsv(boardId){
   closeModal();
   toast('Pick & place CSV exported');
 }
-function updateBomField(boardId, rowId, field, value){
-  const b = findBoard(boardId);
-  const row = b.partsList.find(r=>r.id===rowId);
-  if(!row) return;
+function updateBomField(boardId, rowId, field, value){ safeApply(()=>{
+  const found = requireBomRow(boardId, rowId, 'update this row');
+  if(!found) return;
+  const row = found.row;
   if(field==='x' || field==='y' || field==='angle'){
     row[field] = Number(value)||0;
   } else if(field==='partNumber'){
@@ -1923,11 +2010,11 @@ function updateBomField(boardId, rowId, field, value){
     row.comment = value.trim();
   }
   touch(); renderAll();
-}
+}); }
 function openMatchPicker(boardId, rowId){
-  const b = findBoard(boardId);
-  const row = b ? b.partsList.find(r=>r.id===rowId) : null;
-  const prefill = row ? row.partNumber : '';
+  const found = requireBomRow(boardId, rowId, 'match this row');
+  if(!found) return;
+  const prefill = found.row.partNumber;
   openModal(`
     <div class="modal-title">Match Part</div>
     <div class="field"><label>Search parts</label><input type="text" id="mpSearch" value="${escapeHtml(prefill)}" oninput="mpFilter(this.value)"></div>
@@ -1942,13 +2029,14 @@ function mpFilter(v){
   const s = v.toLowerCase();
   document.querySelectorAll('.mp-row').forEach(el=>{ el.style.display = el.dataset.s.includes(s) ? 'block':'none'; });
 }
-function submitMatch(boardId, rowId, partId){
-  const b = findBoard(boardId);
-  const row = b.partsList.find(r=>r.id===rowId);
-  if(!row) return;
+function submitMatch(boardId, rowId, partId){ safeApply(()=>{
+  const found = requireBomRow(boardId, rowId, 'match this row');
+  if(!found) return;
+  if(!requirePart(partId, 'match to this component')) return;
+  const row = found.row;
   const targetPn = row.partNumber.trim().toLowerCase();
   let count = 0;
-  b.partsList.forEach(r=>{
+  found.board.partsList.forEach(r=>{
     if(!r.matchedPartId && r.partNumber.trim().toLowerCase()===targetPn){
       r.matchedPartId = partId;
       count++;
@@ -1956,7 +2044,7 @@ function submitMatch(boardId, rowId, partId){
   });
   touch(); closeModal(); renderAll();
   toast(count>1 ? `Matched ${count} rows with "${row.partNumber}"` : 'Matched');
-}
+}); }
 
 /* ---- PCB tab: image, pan/zoom, hover highlights ----
    Two independent transforms:
@@ -2673,8 +2761,9 @@ function bsSetOp(op){
   bsCurrentOp = op; lastBoardStockOp = op;
   document.querySelectorAll('#bsOpRow .op-btn').forEach(b=>b.classList.toggle('active', b.dataset.op===op));
 }
-function submitBoardStock(boardId){
-  const b = findBoard(boardId);
+function submitBoardStock(boardId){ safeApply(()=>{
+  const b = requireBoard(boardId, 'adjust stock');
+  if(!b) return;
   const op = bsCurrentOp;
   const qty = Number(document.getElementById('bsQty').value)||0;
   const comment = document.getElementById('bsComment').value.trim();
@@ -2684,7 +2773,7 @@ function submitBoardStock(boardId){
   else { delta = qty-b.boardQty; b.boardQty = qty; }
   b.journal.push({id:uid('bj'), date:nowISO(), type:'manual', text:`Manual adjustment: ${op} ${qty}${comment?' — '+comment:''}`, qtyDelta:delta});
   touch(); closeModal(); renderAll(); toast('Product stock updated');
-}
+}); }
 
 /* ---- Journal tab with filters ---- */
 let boardSalesRange = 'all';
@@ -3106,7 +3195,8 @@ function afterSalesGraph(){
 }
 
 function openSaleForm(saleId){
-  const s = saleId ? DB.sales.find(x=>x.id===saleId) : null;
+  const s = saleId ? requireSale(saleId, 'edit this sale') : null;
+  if(saleId && !s) return;
   const customers = Array.from(new Set(DB.sales.map(x=>x.customer))).filter(Boolean);
   const locations = Array.from(new Set(DB.sales.map(x=>x.location))).filter(Boolean);
   openModal(`
@@ -3180,7 +3270,7 @@ function revertSaleItemsFromBoards(items, note){
     if(note) board.journal.push({id:uid('bj'), date:nowISO(), type:'sale', text:`${note} (restored ${it.qty})`, qtyDelta:it.qty});
   });
 }
-function submitSale(saleId){
+function submitSale(saleId){ safeApply(()=>{
   const customer = document.getElementById('slCustomer').value.trim();
   const location = document.getElementById('slLocation').value.trim();
   const date = dateInputToISO(document.getElementById('slDate').value);
@@ -3190,7 +3280,8 @@ function submitSale(saleId){
   if(!customer || items.length===0){ toast('Customer and at least one product line are required'); return; }
 
   if(saleId){
-    const s = DB.sales.find(x=>x.id===saleId);
+    const s = requireSale(saleId, 'save this sale');
+    if(!s) return;
     revertSaleItemsFromBoards(s.items, null); // silently undo old effect, no extra journal noise
     s.customer=customer; s.location=location; s.date=date; s.comment=comment; s.notes=notes; s.items=items;
     applySaleItemsToBoards(items, date, customer, comment, 'Sale edited:');
@@ -3199,14 +3290,15 @@ function submitSale(saleId){
     applySaleItemsToBoards(items, date, customer, comment, 'Sold');
   }
   touch(); closeModal(); renderAll(); toast('Sale saved');
-}
+}); }
 function deleteSale(saleId){
-  confirmAction('Delete this sale? Product stock will be restored.', ()=>{
-    const s = DB.sales.find(x=>x.id===saleId);
+  confirmAction('Delete this sale? Product stock will be restored.', ()=>safeApply(()=>{
+    const s = requireSale(saleId, 'delete this sale');
+    if(!s) return;
     revertSaleItemsFromBoards(s.items, 'Sale deleted');
     DB.sales = DB.sales.filter(x=>x.id!==saleId);
     touch(); renderAll(); toast('Sale deleted');
-  });
+  }));
 }
 
 /* ============================= JOURNAL PAGE ============================= */
